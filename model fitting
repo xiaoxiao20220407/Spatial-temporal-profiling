@@ -1,0 +1,411 @@
+library(foreign)
+library(raster)
+library(xts)
+library(plotKML)
+library(maptools)
+library(spatstat)
+library(rgdal)
+library(sp)
+library(rgeos)
+library(readxl)
+library(INLA)
+library(maps)
+library(foreign)
+library(raster)
+library(maptools)
+library(sp)
+library(rgeos)
+library(ggplot2)
+library(MASS)
+library(MBA)
+library(fields)
+library(combinat)
+library(spdep)
+library(gtools)
+library(matrixStats)
+library(gcookbook)
+library(cowplot)
+setwd('D:\\XHY\\XHY\\')
+
+# #1 prepare oberved data #####
+load(file="result231\\data.RData")
+
+## 1.1 define locationID ####
+data$longitude<-round(data$longitude,2)
+data$latitude<-round(data$latitude,2)
+data<-data[with(data,order(data$longitude,data$latitude)),]
+data$loc_id<-cumsum(!duplicated(data[,c("longitude","latitude")]))
+
+
+## 1.2 seprated adm level ####
+data_a1<-data[which(data$PointType=="ADM1"),]
+data_a2<-data[which(data$PointType=="ADM2"),]
+data_p1<-data[which(data$PointType=="ADM3"),]
+data_p2<-data[which(data$PointType=="Village"),]
+data_p3<-data[which(data$PointType=="School"),]
+data_p<-rbind(data_p1,data_p2,data_p3)
+
+
+# 2 stack ####
+## 2.1 setting ####
+# Intercept
+data_p$Intercept=1
+data_a1$Intercept=1
+data_a2$Intercept=1
+
+# coordinates 
+coords <- cbind(data$longitude,data$latitude)
+colnames(coords)<-c("x","y")
+coords.a1 <- cbind(data_a1$longitude,data_a1$latitude)
+colnames(coords.a1)<-c("x","y")
+coords.a2 <- cbind(data_a2$longitude,data_a2$latitude)
+colnames(coords.a2)<-c("x","y")
+
+## 2.2 boundaries####
+a<-shapefile("D:\\XHY\\XHY\\shp\\gadm36_KOR_shp\\gadm36_KOR_2.shp")
+a$GID_0 <- 1
+plot(a)
+IDs <- a$GID_0
+IDs[IDs %in% c(min(IDs):max(IDs))] <- "1"
+outer_border <- unionSpatialPolygons(a, IDs)
+plot(outer_border)
+boundaries<-fortify(outer_border)
+boundaries<-boundaries[,1:2]
+colnames(boundaries)<-c("x","y")
+plot(boundaries)
+
+
+## 2.3 mesh ####
+dist<-dist(as.matrix(coords), method = "euclidean", diag = FALSE, upper = FALSE, p = 2)
+max(dist)/2
+kappa=3*2/max(dist) #####2/max
+mesh <- inla.mesh.create.helper(points=as.matrix(coords),
+                                points.domain=cbind(boundaries$x,boundaries$y),
+                                max.edge=c(0.2/kappa,0.4/kappa),
+                                cutoff=0.01/kappa, ##0.01
+                                offset=c(0.2,0.5),
+                                plot.delay=NULL)
+plot(mesh)
+points(boundaries,lwd=3)
+points(as.matrix(coords),pch=20,cex=1,col=2)
+#definition of the SPDE model
+spde <- inla.spde2.matern(mesh=mesh,alpha=2)
+
+
+## 2.4 Time Knots ####
+# gtime<-1978:2018
+gtime<-seq(1970,2020,by=10)
+mesh.t<-inla.mesh.1d(gtime,degree = 2,boundary = c('neumann',"free"))
+idx.st<-inla.spde.make.index('i',n.spde = spde$n.spde, n.group = mesh.t$m)
+
+
+
+## 2.5 PS ####
+### 2.5.1 PS data####
+point_pro<-data
+#national survey
+load(file="result231\\point_pro.RData")
+### 2.5.2 PS code ####
+source("D:\\XHY\\XHY\\spde-book-functions.R")
+dmesh <- book.mesh.dual(mesh)
+library(rgeos)
+#define boundary
+bb<-shapefile("D:\\XHY\\XHY\\shp\\gadm36_KOR_shp\\gadm36_KOR_2.shp")
+bb$GID_0 <- 1
+IDs <- bb$GID_0
+IDs[IDs %in% c(min(IDs):max(IDs))] <- "1"
+IDs[IDs %in% c(max(IDs):min(IDs))] <- "1"
+BB <- unionSpatialPolygons(bb, IDs)
+BB1<- gBuffer(bb, byid=TRUE, width=0)
+<-sapply(1:length(dmesh), function(i) {
+   if (gIntersects(dmesh[i,], BB1))
+     return(gArea(gIntersection(dmesh[i,], BB1)))
+   else return(0)
+ })
+gArea(BB)
+#each point data belong to which polygon
+area <- factor(over(SpatialPoints(cbind(point_pro$longitude, point_pro$latitude)),
+                    dmesh), levels=1:length(dmesh))
+
+#time mesh belong to each data point
+t.breaks <- sort(c(mesh.t$loc[c(1,mesh.t$n)],
+                   mesh.t$loc[2:mesh.t$n-1]/2 + mesh.t$loc[2:mesh.t$n]/2))
+table(time <- factor(findInterval(point_pro$YearSurvey, t.breaks),
+                     levels=1:(length(t.breaks)-1)))
+agg.dat <- as.data.frame(table(area, time))
+
+for(j in 1:2) ### set time and area as integer
+  agg.dat[[j]] <- as.integer(as.character(agg.dat[[j]]))
+str(agg.dat)
+from<-seq(1,mesh.t$n)
+agg.dat$time<-gtime[match(agg.dat$time,from)]
+
+#time weight
+w.t <- c(5,10,10,10,10,5)
+#expected per unit area per time
+i0<-length(point_pro)/(gArea(BB)*diff(range(mesh.t$loc)))
+#space-time volumn
+e0 <- rep(w, mesh.t$n) * rep(w.t, spde$n.spde)
+App = inla.spde.make.A(mesh, loc=mesh$loc[agg.dat$area,1:2],group=agg.dat$time,group.mesh=mesh.t)
+idx_p <- inla.spde.make.index('j', spde$n.spde, n.group=mesh.t$m)
+stack.poisson <- inla.stack(data=list(y=cbind(NA,NA,agg.dat$Freq), exposure=e0),
+                            A=list(App, 1),
+                            effects=list(idx_p,list(data.frame(b0=rep(1,nrow(agg.dat))))) 
+)
+
+## 2.6 Point ####
+#### 2.6.1 divide data ####
+# to two distribution by the NumExame is NA or not
+data_p_bino<-data_p[-which(is.na(data_p$NumExamine)),]
+data_p_beta<-data_p[which(is.na(data_p$NumExamine)),]
+data_p_beta$pos<-data_p_beta$PercentPositive/100
+data_p_beta[which(data_p_beta$pos==0),"pos"]<-0.00000000001
+
+#### 2.6.2 bino ####
+predictor2<-c("loc_id","SurveyType","DiagnosticStool1","DiagnosticStool2",
+              "SurveyType","urban","landcover1","landcover2","landcover3",
+              "elevation1","elevation2","hii1","hii2","soilmoisture1","soilmoisture2","ATC1","ATC2",
+              "sbio12","swater_dist","slst_day","slst_night","slight_c","sndvi"
+)
+
+coords_p_bino <- cbind(data_p_bino$longitude,data_p_bino$latitude)
+colnames(coords_p_bino)<-c("x","y")
+
+
+Ap_bino = inla.spde.make.A(mesh, loc=as.matrix(coords_p_bino),group.mesh=mesh.t,group=data_p_bino$YearSurvey)
+
+stack.p_bino = inla.stack(data = list(y=cbind(data_p_bino$NumPositive,NA,NA),Ntrials=data_p_bino$NumExamine,link="logit"),
+                          A = list(Ap_bino, 1),
+                          effects = list(c(idx.st, list(Intercept=1)),
+                                         list(data_p_bino[predictor2])),
+                          tag="point_bino")
+
+
+#### 2.6.3 beta ####
+coords_p_beta <- cbind(data_p_beta$longitude,data_p_beta$latitude)
+colnames(coords_p_beta)<-c("x","y")
+
+Ap_beta = inla.spde.make.A(mesh, loc=as.matrix(coords_p_beta),group.mesh=mesh.t,group=data_p_beta$YearSurvey)
+
+stack.p_beta = inla.stack(data = list(y=cbind(NA,data_p_beta$pos,NA),link="logit"),
+                          A = list(Ap_beta, 1),
+                          effects = list(c(idx.st, list(Intercept=1)),
+                                         list(data_p_beta[predictor2])),
+                          tag="point_beta")
+
+
+## 2.7 ADM1 ####
+
+### 2.7.1 mesh loc ####
+area.poly1 <- shapefile("D:\\XHY\\XHY\\shp\\gadm36_KOR_shp\\gadm36_KOR_1.shp")
+mesh.coord.in1 <- NULL
+for(i in 1:length(area.poly1)){
+  mesh.coord1 <- SpatialPoints(mesh$loc,proj4string=CRS(proj4string(area.poly1)))
+  x <- as.vector(which(!is.na(over(mesh.coord1, area.poly1[i,]))))
+  x <- x[which(x<=length(mesh.coord1))]
+  mesh.coord.in1 <- rbind(mesh.coord.in1 , mesh$loc[x,])
+}
+
+### 2.7.2 mesh loc id ####
+mesh.coord.in1 <- mesh.coord.in1[,1:2]
+block1 <- rep(0, nrow(mesh.coord.in1))
+print(length(block1))
+for(i in 1:length(area.poly1)){
+  locin1<-SpatialPoints(mesh.coord.in1,proj4string=CRS(proj4string(area.poly1)))
+  x<-as.vector(which(!is.na((over(locin1,area.poly1[i,])))))
+  if(length(x)!=0){
+    for(j in 1:length(x)){
+      if(x[j]<=nrow(mesh.coord.in1)){
+        block1[x[j]] <- i
+      }
+    }
+  }
+}
+
+data_a1$ID <- data_a1$ID1
+### 2.7.3 bino ####
+data_a1_bino<-data_a1[-which(is.na(data_a1$NumExamine)),]
+
+# bsid for observed data
+data_a1_bino$surveyid<-seq(1,nrow(data_a1_bino))
+data_a1_bino<-data_a1_bino[with(data_a1_bino,order(data_a1_bino$ID,data_a1_bino$surveyid)),]
+data_a1_bino$bs_id<-cumsum(!duplicated(data_a1_bino[,c("ID","surveyid")]))
+
+# merge data
+locint1<-cbind(data.frame(locin1),block1)
+colnames(locint1)<-c("long_loc","lat_loc","ID")
+merg1_bino<-merge(locint1,data_a1_bino)
+merg1_bino<-merg1_bino[with(merg1_bino,order(merg1_bino$bs_id)),]
+
+
+Aa1_bino <- inla.spde.make.A(mesh=mesh,loc=as.matrix(data.frame(merg1_bino[,c("long_loc","lat_loc")])),
+                             group.mesh=mesh.t,group=merg1_bino$YearSurvey,
+                             block=merg1_bino$bs_id, block.rescale="sum")
+
+stack.a1_bino = inla.stack(data = list(y=cbind(data_a1_bino$NumPositive,NA,NA),Ntrials=data_a1_bino$NumExamine,link="logit"),
+                           A = list(Aa1_bino, 1),
+                           effects = list(c(idx.st, list(Intercept=1)),
+                                          list(data_a1_bino[predictor2])),
+                           tag="areal1_bino")
+
+
+### 2.7.4 beta ####
+data_a1_beta<-data_a1[which(is.na(data_a1$NumExamine)),]
+data_a1_beta$pos<-data_a1_beta$PercentPositive/100
+data_a1_beta[which(data_a1_beta$pos==0),"pos"]<-0.00000000001
+
+# bsid for observed data
+data_a1_beta$surveyid<-seq(1,nrow(data_a1_beta))
+data_a1_beta<-data_a1_beta[with(data_a1_beta,order(data_a1_beta$ID,data_a1_beta$surveyid)),]
+data_a1_beta$bs_id<-cumsum(!duplicated(data_a1_beta[,c("ID","surveyid")]))
+
+# merge data
+locint1<-cbind(data.frame(locin1),block1)
+colnames(locint1)<-c("long_loc","lat_loc","ID")
+merg1_beta<-merge(locint1,data_a1_beta)
+merg1_beta<-merg1_beta[with(merg1_beta,order(merg1_beta$bs_id)),]
+
+
+Aa1_beta <- inla.spde.make.A(mesh=mesh,loc=as.matrix(data.frame(merg1_beta[,c("long_loc","lat_loc")])),
+                             group.mesh=mesh.t,group=merg1_beta$YearSurvey,
+                             block=merg1_beta$bs_id, block.rescale="sum")
+
+stack.a1_beta = inla.stack(data = list(y=cbind(NA,data_a1_beta$pos,NA),link="logit"),
+                           A = list(Aa1_beta, 1),
+                           effects = list(c(idx.st, list(Intercept=1)),
+                                          list(data_a1_beta[predictor2])),
+                           tag="areal1_beta")
+
+
+
+
+## 2.8 ADM2 #####
+### 2.8.1 mesh loc ####
+area.poly2 <- shapefile("D:\\XHY\\XHY\\shp\\gadm36_KOR_shp\\gadm36_KOR_2.shp")
+mesh.coord.in2 <- NULL
+for(i in 1:length(area.poly2)){
+  mesh.coord2 <- SpatialPoints(mesh$loc,proj4string=CRS(proj4string(area.poly2)))
+  x <- as.vector(which(!is.na(over(mesh.coord2, area.poly2[i,]))))
+  x <- x[which(x<=length(mesh.coord2))]
+  mesh.coord.in2 <- rbind(mesh.coord.in2 , mesh$loc[x,])
+}
+
+### 2.8.2 mesh loc id ####
+mesh.coord.in2 <- mesh.coord.in2[,1:2]
+block2 <- rep(0, nrow(mesh.coord.in2))
+print(length(block2))
+for(i in 1:length(area.poly2)){
+  locin2<-SpatialPoints(mesh.coord.in2,proj4string=CRS(proj4string(area.poly2)))
+  x<-as.vector(which(!is.na((over(locin2,area.poly2[i,])))))
+  if(length(x)!=0){
+    for(j in 1:length(x)){
+      if(x[j]<=nrow(mesh.coord.in2)){
+        block2[x[j]] <- i
+      }
+    }
+  }
+}
+
+data_a2$ID <- data_a2$ID2
+
+### 2.8.3 bino ####
+data_a2_bino<-data_a2[-which(is.na(data_a2$NumExamine)),]
+
+# bsid for observed data
+data_a2_bino$surveyid<-seq(1,nrow(data_a2_bino))
+data_a2_bino<-data_a2_bino[with(data_a2_bino,order(data_a2_bino$ID,data_a2_bino$surveyid)),]
+data_a2_bino$bs_id<-cumsum(!duplicated(data_a2_bino[,c("ID","surveyid")]))
+
+# merge data 
+locint2<-cbind(data.frame(locin2),block2)
+colnames(locint2)<-c("long_loc","lat_loc","ID")
+merg2_bino<-merge(locint2,data_a2_bino)
+merg2_bino<-merg2_bino[with(merg2_bino,order(merg2_bino$bs_id)),]
+
+
+Aa2_bino <- inla.spde.make.A(mesh=mesh,loc=as.matrix(data.frame(merg2_bino[,c("long_loc","lat_loc")])),
+                             group.mesh=mesh.t,group=merg2_bino$YearSurvey,
+                             block=merg2_bino$bs_id, block.rescale="sum")
+
+stack.a2_bino = inla.stack(data = list(y=cbind(data_a2_bino$NumPositive,NA,NA),Ntrials=data_a2_bino$NumExamine,link="logit"),
+                           A = list(Aa2_bino, 1),
+                           effects = list(c(idx.st, list(Intercept=1)),
+                                          list(data_a2_bino[predictor2])),
+                           tag="areal2_bino")
+
+
+### 2.8.4 beta ####
+data_a2_beta<-data_a2[which(is.na(data_a2$NumExamine)),]
+data_a2_beta$pos<-data_a2_beta$PercentPositive/100
+data_a2_beta[which(data_a2_beta$pos==0),"pos"]<-0.00000000001
+
+# bsid for observed data
+data_a2_beta$surveyid<-seq(1,nrow(data_a2_beta))
+data_a2_beta<-data_a2_beta[with(data_a2_beta,order(data_a2_beta$ID,data_a2_beta$surveyid)),]
+data_a2_beta$bs_id<-cumsum(!duplicated(data_a2_beta[,c("ID","surveyid")]))
+
+# merge data 
+locint2<-cbind(data.frame(locin2),block2)
+colnames(locint2)<-c("long_loc","lat_loc","ID")
+merg2_beta<-merge(locint2,data_a2_beta)
+merg2_beta<-merg2_beta[with(merg2_beta,order(merg2_beta$bs_id)),]
+
+
+Aa2_beta <- inla.spde.make.A(mesh=mesh,loc=as.matrix(data.frame(merg2_beta[,c("long_loc","lat_loc")])),
+                             group.mesh=mesh.t,group=merg2_beta$YearSurvey,
+                             block=merg2_beta$bs_id, block.rescale="sum")
+
+stack.a2_beta = inla.stack(data = list(y=cbind(NA,data_a2_beta$pos,NA),link="logit"),
+                           A = list(Aa2_beta, 1),
+                           effects = list(c(idx.st, list(Intercept=1)),
+                                          list(data_a2_beta[predictor2])),
+                           tag="areal2_beta")
+
+
+
+#3 model fitting ####
+gaus.prior <- list(prior = 'gaussian', param = c(0, 2))
+for1<-c("-1","Intercept","f(i, model=spde,group=i.group, control.group=list(model='ar1'))","f(loc_id,model='iid')")
+for2<-c("b0","f(j, copy='i',fixed=FALSE,hyper=list(theta=gaus.prior))")
+para2<-c("DiagnosticStool1","DiagnosticStool2","hii1","hii2","urban",
+  "swater_dist","sbio12","sndvi"
+)
+
+formula <- as.formula(paste("y ~ ", paste(paste(for2, collapse= "+"),paste(for1, collapse= "+"),paste(para2, collapse= "+"),sep="+")))
+stack.bino <- inla.stack(stack.p_bino,stack.a2_bino,stack.a1_bino)
+stack.beta <- inla.stack(stack.p_beta,stack.a2_beta,stack.a1_beta)
+stack.full <- inla.stack(stack.bino,stack.beta,stack.poisson)
+
+link<-rep(NA,length(stack.full$data$data$y.2))
+link[which(is.na(link))]<-1
+
+t1<-Sys.time()
+result <- inla(formula,data=inla.stack.data(stack.full,spde=spde),family=c("binomial","beta","poisson"),
+               Ntrials=inla.stack.data(stack.full)$Ntrials,E=inla.stack.data(stack.full)$exposure,
+               control.predictor=list(compute=TRUE,A=inla.stack.A(stack.full),
+                                      quantiles=c(0.025,0.5,0.975),link=link),control.compute = list(dic=TRUE,config=TRUE,cpo=TRUE),
+               control.inla = list(int.strategy = "eb"),
+               control.mode = list(theta=c(3.9846264,-4.0554996,2.2808215,0.4976130,-0.1124745,3.2314289)),
+               verbose=TRUE)
+t2<-Sys.time()
+t1
+t2
+
+
+#### 3.1 posterior ####
+res.s <- inla.spde.result(result,"i",spde,do.transform = TRUE)
+# eg for the range
+inla.qmarginal(c(0.025,0.5,0.975),res.s$marginals.range.nominal[[1]])
+
+# for point spatial variance
+inla.qmarginal(c(0.025,0.5,0.975), res.s$marginals.variance.nominal[[1]])
+
+# for non-spatial variance
+sigma2nonspatial=inla.tmarginal(function(x) 1/x, result$marginals.hyper$"Precision for loc_id")
+inla.qmarginal(c(0.025,0.5,0.975), sigma2nonspatial)
+
+# for variance of beta-likelihood
+sigma2beta=inla.tmarginal(function(x) 1/x, result$marginals.hyper$`precision parameter for the beta observations[2]`)
+inla.qmarginal(c(0.025,0.5,0.975), sigma2beta)
+
+summary(result)
