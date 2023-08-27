@@ -117,7 +117,7 @@ IDs[IDs %in% c(min(IDs):max(IDs))] <- "1"
 IDs[IDs %in% c(max(IDs):min(IDs))] <- "1"
 BB <- unionSpatialPolygons(bb, IDs)
 BB1<- gBuffer(bb, byid=TRUE, width=0)
-<-sapply(1:length(dmesh), function(i) {
+w <-sapply(1:length(dmesh), function(i) {
    if (gIntersects(dmesh[i,], BB1))
      return(gArea(gIntersection(dmesh[i,], BB1)))
    else return(0)
